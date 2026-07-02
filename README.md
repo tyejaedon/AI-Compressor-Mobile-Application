@@ -124,5 +124,4 @@ Current models behave as autoencoders (`x -> x_hat`) using a single forward pass
 
 ## License
 
-Add your preferred license in this repository (for example: MIT, Apache-2.0).
 
