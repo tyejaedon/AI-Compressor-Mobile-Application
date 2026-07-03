@@ -15,6 +15,11 @@ enum class InferenceDelegate {
     GPU,
 }
 
+enum class ImageNormalizationMode {
+    ZERO_ONE,
+    NEG_ONE_ONE,
+}
+
 data class ModelMetadata(
     val mediaType: MediaType,
     val modelAssetPath: String,
@@ -39,6 +44,37 @@ data class CompressionResult(
     val outputUri: Uri,
     val previewUri: Uri? = null,
     val metrics: CompressionMetrics,
+)
+
+data class CompressionHistoryItem(
+    val id: Long,
+    val mediaType: MediaType,
+    val createdAtEpochMs: Long,
+    val compressionRatio: Double,
+    val latencyMs: Double,
+    val throughputItemsPerSec: Double,
+    val psnr: Double? = null,
+    val ssim: Double? = null,
+    val snr: Double? = null,
+)
+
+enum class CompressionPipelineStage {
+    VALIDATING_INPUT,
+    LOADING_SOURCE,
+    PREPARING_MODEL,
+    RUNNING_INFERENCE,
+    SAVING_OUTPUT,
+    CALCULATING_METRICS,
+    COMPLETED,
+    FAILED,
+}
+
+data class CompressionPipelineStatus(
+    val mediaType: MediaType,
+    val stage: CompressionPipelineStage,
+    val progress: Float,
+    val etaSeconds: Int? = null,
+    val message: String? = null,
 )
 
 data class BatchItem(
@@ -78,5 +114,13 @@ interface CompressionRepository {
     suspend fun cancelBatch(id: String)
 
     fun batchProgress(): Flow<List<BatchProgress>>
+
+    fun observeCompressionPipeline(): Flow<CompressionPipelineStatus?>
+
+    fun observeCompressionHistory(): Flow<List<CompressionHistoryItem>>
+
+    fun imageNormalizationMode(): Flow<ImageNormalizationMode>
+
+    suspend fun setImageNormalizationMode(mode: ImageNormalizationMode)
 }
 

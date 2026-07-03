@@ -1,3 +1,7 @@
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.util.zip.ZipFile
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
@@ -63,17 +67,21 @@ val syncModelAssets by tasks.registering(Copy::class) {
     doFirst {
         fun resolveModelFile(dir: File, expectedAssetName: String, configuredName: String?): File {
             val configured = configuredName?.takeIf { it.isNotBlank() }?.let { dir.resolve(it) }
-            if (configured != null && configured.exists()) return configured
+            if (configured != null) {
+                check(configured.exists()) {
+                    "Configured model '$configuredName' was not found in ${dir.absolutePath}. " +
+                        "Set the correct -P*ModelFile value or update -PmodelBundleDir."
+                }
+                return configured
+            }
             val expected = dir.resolve(expectedAssetName)
-            if (expected.exists()) return expected
-            val availableTflite = dir.listFiles()?.filter { it.isFile && it.extension == "tflite" }.orEmpty()
-            if (availableTflite.size == 1) return availableTflite.first()
-            val availableNames = dir.listFiles()?.map { it.name }?.sorted().orEmpty().joinToString()
-            error(
-                "Missing model for ${dir.absolutePath}. Expected '$expectedAssetName'" +
-                    (configuredName?.let { " or configured '$it'" } ?: "") +
-                    ". Found tflite=${availableTflite.map { it.name }}. Files=[$availableNames]."
-            )
+            check(expected.exists()) {
+                val availableTflite = dir.listFiles()?.filter { it.isFile && it.extension == "tflite" }.orEmpty()
+                val availableNames = dir.listFiles()?.map { it.name }?.sorted().orEmpty().joinToString()
+                "Missing expected model '$expectedAssetName' in ${dir.absolutePath}. " +
+                    "Found tflite=${availableTflite.map { it.name }}. Files=[$availableNames]."
+            }
+            return expected
         }
 
         val requiredFiles = listOf(
@@ -127,9 +135,89 @@ val syncModelAssets by tasks.registering(Copy::class) {
     duplicatesStrategy = DuplicatesStrategy.INCLUDE
 }
 
+val verifyArm64SoLoadAlignmentDebug by tasks.registering {
+    group = "verification"
+    description = "Verifies arm64-v8a .so PT_LOAD segment alignment is >= 16384 in debug APK"
+    dependsOn("packageDebug")
+
+    doLast {
+        val apkFile = layout.buildDirectory.file("outputs/apk/debug/app-debug.apk").get().asFile
+        check(apkFile.exists()) { "Debug APK not found at ${apkFile.absolutePath}" }
+
+        val failures = mutableListOf<String>()
+        ZipFile(apkFile).use { zip ->
+            zip.entries().asSequence()
+                .filter { !it.isDirectory && it.name.startsWith("lib/arm64-v8a/") && it.name.endsWith(".so") }
+                .forEach { entry ->
+                    val data = zip.getInputStream(entry).use { it.readBytes() }
+                    val alignments = elfLoadAlignments(data)
+                    if (alignments.isEmpty()) {
+                        failures += "${entry.name}: no PT_LOAD segments found"
+                    } else {
+                        val below16Kb = alignments.filter { it < minPageAlignmentBytes }
+                        if (below16Kb.isNotEmpty()) {
+                            failures += "${entry.name}: PT_LOAD alignments=$alignments"
+                        }
+                    }
+                }
+        }
+
+        check(failures.isEmpty()) {
+            "16 KB page-size check failed for arm64 native libs:\n${failures.joinToString("\n")}"
+        }
+        println("16 KB page-size check passed for arm64-v8a native libs")
+    }
+}
+
+tasks.configureEach {
+    if (name == "assembleDebug") {
+        dependsOn(verifyArm64SoLoadAlignmentDebug)
+    }
+}
+
 tasks.named("preBuild") {
     dependsOn(syncModelAssets)
 }
+
+fun elfLoadAlignments(elf: ByteArray): List<Long> {
+    if (elf.size < 64 || elf[0] != 0x7f.toByte() || elf[1] != 'E'.code.toByte() || elf[2] != 'L'.code.toByte() || elf[3] != 'F'.code.toByte()) {
+        return emptyList()
+    }
+    val elfClass = elf[4].toInt() and 0xFF
+    val dataEncoding = elf[5].toInt() and 0xFF
+    if (dataEncoding != 1) return emptyList() // little-endian only
+
+    val buffer = ByteBuffer.wrap(elf).order(ByteOrder.LITTLE_ENDIAN)
+    val segments = mutableListOf<Long>()
+    if (elfClass == 2) {
+        val phoff = buffer.getLong(32).toInt()
+        val phentsize = buffer.getShort(54).toInt() and 0xFFFF
+        val phnum = buffer.getShort(56).toInt() and 0xFFFF
+        repeat(phnum) { index ->
+            val base = phoff + (index * phentsize)
+            if (base + 56 > elf.size) return@repeat
+            val pType = buffer.getInt(base)
+            if (pType == 1) {
+                segments += buffer.getLong(base + 48)
+            }
+        }
+    } else if (elfClass == 1) {
+        val phoff = buffer.getInt(28)
+        val phentsize = buffer.getShort(42).toInt() and 0xFFFF
+        val phnum = buffer.getShort(44).toInt() and 0xFFFF
+        repeat(phnum) { index ->
+            val base = phoff + (index * phentsize)
+            if (base + 32 > elf.size) return@repeat
+            val pType = buffer.getInt(base)
+            if (pType == 1) {
+                segments += (buffer.getInt(base + 28).toLong() and 0xFFFF_FFFFL)
+            }
+        }
+    }
+    return segments
+}
+
+val minPageAlignmentBytes = 16_384L
 
 dependencies {
     implementation(project(":core-ui"))

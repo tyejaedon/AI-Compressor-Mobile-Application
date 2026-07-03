@@ -12,6 +12,7 @@ import androidx.navigation.compose.composable
 import com.example.benchmark.BenchmarkScreen
 import com.example.compressorai.MainViewModel
 import com.example.compressorai.ui.DashboardScreen
+import com.example.compressorai.ui.HistoryRoute
 import com.example.feature.audio.AudioCompressionRoute
 import com.example.feature.image.ImageCompressionRoute
 import com.example.feature.video.VideoCompressionRoute
@@ -35,6 +36,9 @@ fun VortexNavGraph(
                 state = state.value,
                 onNavigate = { destination -> navController.navigate(destination.route) },
             )
+        }
+        composable(VortexDestination.History.route) {
+            HistoryRoute(snackbarHostState = snackbarHostState)
         }
         composable(VortexDestination.Image.route) {
             ImageCompressionRoute(snackbarHostState = snackbarHostState)

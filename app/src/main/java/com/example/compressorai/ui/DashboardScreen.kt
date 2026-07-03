@@ -2,12 +2,14 @@ package com.example.compressorai.ui
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
@@ -29,11 +31,11 @@ fun DashboardScreen(
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         item {
-            Text("Vortex Compressor", style = MaterialTheme.typography.headlineMedium)
+            Text("AI Compressor", style = MaterialTheme.typography.headlineMedium)
         }
         item {
             Text(
-                text = "Neural autoencoder compression dashboard",
+                text = "Production dashboard for image, audio, and video compression models",
                 style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -52,12 +54,15 @@ fun DashboardScreen(
         }
 
         item {
-            CompressorCard(title = "Modules", subtitle = "Choose media type") {
+            CompressorCard(title = "Compression Studio", subtitle = "Choose pipeline by media") {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = { onNavigate(VortexDestination.Image) }) { Text("Image Compressor") }
                     Button(onClick = { onNavigate(VortexDestination.Audio) }) { Text("Audio Compressor") }
                     Button(onClick = { onNavigate(VortexDestination.Video) }) { Text("Video Compressor") }
-                    Button(onClick = { onNavigate(VortexDestination.Benchmark) }) { Text("Benchmark") }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(onClick = { onNavigate(VortexDestination.History) }) { Text("History") }
+                        OutlinedButton(onClick = { onNavigate(VortexDestination.Benchmark) }) { Text("Benchmark") }
+                    }
                 }
             }
         }
@@ -83,8 +88,19 @@ fun DashboardScreen(
                 } else {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         state.metadata.forEach { model ->
-                            Text("${model.mediaType.name}: ${model.inputShape.contentToString()} -> ${model.outputShape.contentToString()}")
-                            Text(model.reportSummary.take(180))
+                            CompressorCard(
+                                title = model.mediaType.name.lowercase().replaceFirstChar { it.uppercase() },
+                                subtitle = "${model.inputDType} to ${model.outputDType}",
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text("Input shape: ${model.inputShape.joinToString(" x ")}")
+                                Text("Output shape: ${model.outputShape.joinToString(" x ")}")
+                                Text(
+                                    text = model.reportSummary.take(140),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
                         }
                     }
                 }

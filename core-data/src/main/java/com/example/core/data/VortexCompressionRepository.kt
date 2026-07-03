@@ -3,6 +3,7 @@ package com.example.core.data
 import android.content.Context
 import android.graphics.Bitmap
 import android.net.Uri
+import android.util.Log
 import com.example.core.data.io.MediaFileValidator
 import com.example.core.data.io.MediaIo
 import com.example.core.data.local.CompressionHistoryDao
@@ -12,8 +13,13 @@ import com.example.core.data.queue.BatchQueueManager
 import com.example.core.domain.BatchItem
 import com.example.core.domain.BatchProgress
 import com.example.core.domain.CompressionMetrics
+import com.example.core.domain.CompressionHistoryItem
+import com.example.core.domain.CompressionPipelineStage
+import com.example.core.domain.CompressionPipelineStatus
 import com.example.core.domain.CompressionRepository
 import com.example.core.domain.CompressionResult
+import com.example.core.domain.ImageNormalizationMode
+import com.example.core.domain.InferenceDelegate
 import com.example.core.domain.MediaType
 import com.example.core.domain.ModelMetadata
 import com.example.core.ml.AudioTensorCodec
@@ -33,6 +39,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import androidx.core.graphics.createBitmap
 
@@ -48,6 +55,10 @@ class VortexCompressionRepository @Inject constructor(
 ) : CompressionRepository {
 
     private val batchUpdates = MutableStateFlow<List<BatchProgress>>(emptyList())
+    private val pipelineUpdates = MutableStateFlow<CompressionPipelineStatus?>(null)
+    private val imageRunnerLock = Any()
+    private var cachedImageRunner: TfliteRunner? = null
+    private var cachedImageRunnerDelegate: InferenceDelegate? = null
     private val batchQueueManager = BatchQueueManager(
         emit = { updates -> batchUpdates.value = updates },
         processItem = { item -> processBatchItem(item) },
@@ -64,80 +75,279 @@ class VortexCompressionRepository @Inject constructor(
     }
 
     override suspend fun compressImage(uri: Uri): Result<CompressionResult> = withContext(ioDispatcher) {
+        val startedAtNanos = System.nanoTime()
+        updatePipeline(
+            mediaType = MediaType.IMAGE,
+            stage = CompressionPipelineStage.VALIDATING_INPUT,
+            progress = 0.05f,
+            startedAtNanos = startedAtNanos,
+        )
         runCatching {
             validator.validateImage(uri).getOrThrow()
+            updatePipeline(
+                mediaType = MediaType.IMAGE,
+                stage = CompressionPipelineStage.LOADING_SOURCE,
+                progress = 0.12f,
+                startedAtNanos = startedAtNanos,
+            )
             val sourceBitmap = mediaIo.readBitmap(uri)
             val delegate = settingsStore.preferredDelegate.first()
+            val normalizationMode = settingsStore.imageNormalizationMode.first()
+            updatePipeline(
+                mediaType = MediaType.IMAGE,
+                stage = CompressionPipelineStage.PREPARING_MODEL,
+                progress = 0.2f,
+                startedAtNanos = startedAtNanos,
+            )
+            val runner = acquireImageRunner(delegate)
             var reconstructed = sourceBitmap
-            val latencyNanos = TfliteRunner(context, IMAGE_MODEL_ASSET, delegate).use { runner ->
-                val spec = parseImageSpec(runner.contract().input.shape)
-                measureNanoTime {
-                    reconstructed = reconstructImageWithTiling(
-                        sourceBitmap = sourceBitmap,
-                        runner = runner,
-                        inputSpec = spec,
-                    )
-                }
+            val contract = runner.contract()
+            val inputSpec = parseImageSpec(contract.input.shape)
+            val outputSpec = parseImageSpec(contract.output.shape)
+            require(inputSpec == outputSpec) {
+                "Image model input/output shapes must match for tiled reconstruction. input=$inputSpec output=$outputSpec"
             }
+            val latencyNanos = measureNanoTime {
+                reconstructed = reconstructImageWithTiling(
+                    sourceBitmap = sourceBitmap,
+                    runner = runner,
+                    inputSpec = inputSpec,
+                    normalizationMode = normalizationMode,
+                    onProgress = { completedTiles, totalTiles ->
+                        val tileProgress = completedTiles.toFloat() / totalTiles.toFloat()
+                        updatePipeline(
+                            mediaType = MediaType.IMAGE,
+                            stage = CompressionPipelineStage.RUNNING_INFERENCE,
+                            progress = 0.2f + (tileProgress * 0.65f),
+                            startedAtNanos = startedAtNanos,
+                            completedUnits = completedTiles,
+                            totalUnits = totalTiles,
+                        )
+                    },
+                )
+            }
+            updatePipeline(
+                mediaType = MediaType.IMAGE,
+                stage = CompressionPipelineStage.SAVING_OUTPUT,
+                progress = 0.9f,
+                startedAtNanos = startedAtNanos,
+            )
             val outputUri = mediaIo.saveBitmap(reconstructed, "image-reconstructed")
+            updatePipeline(
+                mediaType = MediaType.IMAGE,
+                stage = CompressionPipelineStage.CALCULATING_METRICS,
+                progress = 0.96f,
+                startedAtNanos = startedAtNanos,
+            )
             val metrics = imageMetrics(sourceBitmap, reconstructed, latencyNanos)
             storeHistory(uri, outputUri, MediaType.IMAGE, metrics)
+            updatePipeline(
+                mediaType = MediaType.IMAGE,
+                stage = CompressionPipelineStage.COMPLETED,
+                progress = 1f,
+                startedAtNanos = startedAtNanos,
+                etaSeconds = 0,
+            )
             CompressionResult(inputUri = uri, outputUri = outputUri, previewUri = outputUri, metrics = metrics)
+        }.onFailure { throwable ->
+            updatePipeline(
+                mediaType = MediaType.IMAGE,
+                stage = CompressionPipelineStage.FAILED,
+                progress = 1f,
+                startedAtNanos = startedAtNanos,
+                message = throwable.message ?: "Image compression failed",
+            )
         }
     }
 
     override suspend fun compressAudio(uri: Uri): Result<CompressionResult> = withContext(ioDispatcher) {
+        val startedAtNanos = System.nanoTime()
+        updatePipeline(
+            mediaType = MediaType.AUDIO,
+            stage = CompressionPipelineStage.VALIDATING_INPUT,
+            progress = 0.05f,
+            startedAtNanos = startedAtNanos,
+        )
         runCatching {
             validator.validateAudio(uri).getOrThrow()
+            updatePipeline(
+                mediaType = MediaType.AUDIO,
+                stage = CompressionPipelineStage.LOADING_SOURCE,
+                progress = 0.15f,
+                startedAtNanos = startedAtNanos,
+            )
             val source = mediaIo.readWavMonoFloat(uri)
             val delegate = settingsStore.preferredDelegate.first()
 
             val reconstructedChunks = mutableListOf<Array<Array<FloatArray>>>()
             var outputWindow = 1
             lateinit var chunks: List<Array<Array<FloatArray>>>
+            updatePipeline(
+                mediaType = MediaType.AUDIO,
+                stage = CompressionPipelineStage.PREPARING_MODEL,
+                progress = 0.25f,
+                startedAtNanos = startedAtNanos,
+            )
             val latencyNanos = TfliteRunner(context, AUDIO_MODEL_ASSET, delegate).use { runner ->
                 val contract = runner.contract()
                 val inputWindow = parseAudioWindow(contract.input.shape)
                 outputWindow = parseAudioWindow(contract.output.shape)
+                require(inputWindow == outputWindow) {
+                    "Audio model input/output windows must match. input=$inputWindow output=$outputWindow"
+                }
                 chunks = AudioTensorCodec.preprocess(source, inputWindow)
+                val totalChunks = chunks.size.coerceAtLeast(1)
                 measureNanoTime {
-                    chunks.forEach { chunk ->
+                    chunks.forEachIndexed { index, chunk ->
                         val out = AudioTensorCodec.outputWindow(outputWindow)
                         runner.run(chunk, out)
                         reconstructedChunks += out
+                        val completedChunks = index + 1
+                        val chunkProgress = completedChunks.toFloat() / totalChunks.toFloat()
+                        updatePipeline(
+                            mediaType = MediaType.AUDIO,
+                            stage = CompressionPipelineStage.RUNNING_INFERENCE,
+                            progress = 0.3f + (chunkProgress * 0.55f),
+                            startedAtNanos = startedAtNanos,
+                            completedUnits = completedChunks,
+                            totalUnits = totalChunks,
+                        )
                     }
                 }
             }
 
+            updatePipeline(
+                mediaType = MediaType.AUDIO,
+                stage = CompressionPipelineStage.SAVING_OUTPUT,
+                progress = 0.9f,
+                startedAtNanos = startedAtNanos,
+            )
             val reconstructed = AudioTensorCodec.postprocess(reconstructedChunks, source.size, outputWindow)
-            val outputUri = mediaIo.writeWavMonoFloat(reconstructed, "audio-reconstructed", sampleRate = 16_000)
+            val outputUri = mediaIo.writeWavMonoFloat(reconstructed, "audio-reconstructed", sampleRate = REQUIRED_AUDIO_SAMPLE_RATE)
+            updatePipeline(
+                mediaType = MediaType.AUDIO,
+                stage = CompressionPipelineStage.CALCULATING_METRICS,
+                progress = 0.96f,
+                startedAtNanos = startedAtNanos,
+            )
             val metrics = audioMetrics(source, reconstructed, latencyNanos)
             storeHistory(uri, outputUri, MediaType.AUDIO, metrics)
+            updatePipeline(
+                mediaType = MediaType.AUDIO,
+                stage = CompressionPipelineStage.COMPLETED,
+                progress = 1f,
+                startedAtNanos = startedAtNanos,
+                etaSeconds = 0,
+            )
             CompressionResult(inputUri = uri, outputUri = outputUri, previewUri = null, metrics = metrics)
+        }.onFailure { throwable ->
+            updatePipeline(
+                mediaType = MediaType.AUDIO,
+                stage = CompressionPipelineStage.FAILED,
+                progress = 1f,
+                startedAtNanos = startedAtNanos,
+                message = throwable.message ?: "Audio compression failed",
+            )
         }
     }
 
     override suspend fun compressVideo(uri: Uri): Result<CompressionResult> = withContext(ioDispatcher) {
+        val startedAtNanos = System.nanoTime()
+        updatePipeline(
+            mediaType = MediaType.VIDEO,
+            stage = CompressionPipelineStage.VALIDATING_INPUT,
+            progress = 0.05f,
+            startedAtNanos = startedAtNanos,
+        )
         runCatching {
             validator.validateVideo(uri).getOrThrow()
+            updatePipeline(
+                mediaType = MediaType.VIDEO,
+                stage = CompressionPipelineStage.PREPARING_MODEL,
+                progress = 0.15f,
+                startedAtNanos = startedAtNanos,
+            )
             val delegate = settingsStore.preferredDelegate.first()
             val (sourceFrames, reconstructedFrames, latencyNanos) = TfliteRunner(context, VIDEO_MODEL_ASSET, delegate).use { runner ->
                 val contract = runner.contract()
                 val inputSpec = parseVideoSpec(contract.input.shape)
                 val outputSpec = parseVideoSpec(contract.output.shape)
+                require(inputSpec == outputSpec) {
+                    "Video model input/output specs must match. input=$inputSpec output=$outputSpec"
+                }
+                updatePipeline(
+                    mediaType = MediaType.VIDEO,
+                    stage = CompressionPipelineStage.LOADING_SOURCE,
+                    progress = 0.25f,
+                    startedAtNanos = startedAtNanos,
+                )
                 val sourceFrames = mediaIo.readVideoFrames(uri, inputSpec.frames)
                 require(sourceFrames.isNotEmpty()) { "No frames decoded from source video" }
-                val clip = toVideoClip(sourceFrames, inputSpec)
+                val clip = toVideoClip(
+                    frames = sourceFrames,
+                    inputSpec = inputSpec,
+                    onFramePrepared = { completed, total ->
+                        val prepProgress = completed.toFloat() / total.toFloat()
+                        updatePipeline(
+                            mediaType = MediaType.VIDEO,
+                            stage = CompressionPipelineStage.PREPARING_MODEL,
+                            progress = 0.3f + (prepProgress * 0.2f),
+                            startedAtNanos = startedAtNanos,
+                            completedUnits = completed,
+                            totalUnits = total,
+                        )
+                    },
+                )
                 val out = VideoTensorCodec.outputClip(outputSpec.frames, outputSpec.height, outputSpec.width, outputSpec.channels)
+                updatePipeline(
+                    mediaType = MediaType.VIDEO,
+                    stage = CompressionPipelineStage.RUNNING_INFERENCE,
+                    progress = 0.55f,
+                    startedAtNanos = startedAtNanos,
+                )
                 val latencyNanos = measureNanoTime {
                     runner.run(clip, out)
                 }
+                updatePipeline(
+                    mediaType = MediaType.VIDEO,
+                    stage = CompressionPipelineStage.RUNNING_INFERENCE,
+                    progress = 0.82f,
+                    startedAtNanos = startedAtNanos,
+                    etaSeconds = 1,
+                )
                 Triple(sourceFrames, fromVideoClip(out), latencyNanos)
             }
+            updatePipeline(
+                mediaType = MediaType.VIDEO,
+                stage = CompressionPipelineStage.SAVING_OUTPUT,
+                progress = 0.92f,
+                startedAtNanos = startedAtNanos,
+            )
             val outputPreviewUri = mediaIo.saveFramesAsPreviewStrip(reconstructedFrames, "video-reconstructed")
+            updatePipeline(
+                mediaType = MediaType.VIDEO,
+                stage = CompressionPipelineStage.CALCULATING_METRICS,
+                progress = 0.97f,
+                startedAtNanos = startedAtNanos,
+            )
             val metrics = videoMetrics(sourceFrames, reconstructedFrames, latencyNanos)
             storeHistory(uri, outputPreviewUri, MediaType.VIDEO, metrics)
+            updatePipeline(
+                mediaType = MediaType.VIDEO,
+                stage = CompressionPipelineStage.COMPLETED,
+                progress = 1f,
+                startedAtNanos = startedAtNanos,
+                etaSeconds = 0,
+            )
             CompressionResult(inputUri = uri, outputUri = outputPreviewUri, previewUri = outputPreviewUri, metrics = metrics)
+        }.onFailure { throwable ->
+            updatePipeline(
+                mediaType = MediaType.VIDEO,
+                stage = CompressionPipelineStage.FAILED,
+                progress = 1f,
+                startedAtNanos = startedAtNanos,
+                message = throwable.message ?: "Video compression failed",
+            )
         }
     }
 
@@ -154,6 +364,32 @@ class VortexCompressionRepository @Inject constructor(
     }
 
     override fun batchProgress(): Flow<List<BatchProgress>> = batchUpdates.asStateFlow()
+
+    override fun observeCompressionPipeline(): Flow<CompressionPipelineStatus?> = pipelineUpdates.asStateFlow()
+
+    override fun observeCompressionHistory(): Flow<List<CompressionHistoryItem>> {
+        return historyDao.observeRecent().map { entities ->
+            entities.map { entity ->
+                CompressionHistoryItem(
+                    id = entity.id,
+                    mediaType = runCatching { MediaType.valueOf(entity.mediaType) }.getOrDefault(MediaType.IMAGE),
+                    createdAtEpochMs = entity.createdAtEpochMs,
+                    compressionRatio = entity.compressionRatio,
+                    latencyMs = entity.latencyMs,
+                    throughputItemsPerSec = CompressionMetricsCalculator.throughput(1, entity.latencyMs),
+                    psnr = entity.psnr,
+                    ssim = entity.ssim,
+                    snr = entity.snr,
+                )
+            }
+        }
+    }
+
+    override fun imageNormalizationMode(): Flow<ImageNormalizationMode> = settingsStore.imageNormalizationMode
+
+    override suspend fun setImageNormalizationMode(mode: ImageNormalizationMode) {
+        settingsStore.setImageNormalizationMode(mode)
+    }
 
     private suspend fun processBatchItem(item: BatchItem): Result<Unit> {
         val result = when (item.mediaType) {
@@ -253,7 +489,11 @@ class VortexCompressionRepository @Inject constructor(
         }
     }
 
-    private fun toVideoClip(frames: List<Bitmap>, inputSpec: VideoModelSpec): Array<Array<Array<Array<FloatArray>>>> {
+    private fun toVideoClip(
+        frames: List<Bitmap>,
+        inputSpec: VideoModelSpec,
+        onFramePrepared: (completed: Int, total: Int) -> Unit = { _, _ -> },
+    ): Array<Array<Array<Array<FloatArray>>>> {
         val clip = Array(1) {
             Array(inputSpec.frames) {
                 Array(inputSpec.height) { Array(inputSpec.width) { FloatArray(inputSpec.channels) } }
@@ -272,6 +512,7 @@ class VortexCompressionRepository @Inject constructor(
                     clip[0][frameIndex][y][x][2] = (pixel and 0xFF) / 255f
                 }
             }
+            onFramePrepared(frameIndex + 1, selected.size)
         }
         return clip
     }
@@ -299,6 +540,8 @@ class VortexCompressionRepository @Inject constructor(
         sourceBitmap: Bitmap,
         runner: TfliteRunner,
         inputSpec: ImageModelSpec,
+        normalizationMode: ImageNormalizationMode,
+        onProgress: (completedTiles: Int, totalTiles: Int) -> Unit,
     ): Bitmap {
         val width = sourceBitmap.width
         val height = sourceBitmap.height
@@ -306,9 +549,18 @@ class VortexCompressionRepository @Inject constructor(
         val tileHeight = inputSpec.height
         if (width <= tileWidth && height <= tileHeight) {
             val outputTensor = ImageTensorCodec.outputBuffer(tileHeight, tileWidth, inputSpec.channels)
-            val inputTensor = ImageTensorCodec.preprocess(sourceBitmap, tileWidth, tileHeight, inputSpec.channels)
+            val inputTensor = ImageTensorCodec.preprocess(
+                bitmap = sourceBitmap,
+                targetWidth = tileWidth,
+                targetHeight = tileHeight,
+                channels = inputSpec.channels,
+                normalizationMode = normalizationMode,
+            )
+            logTensorDiagnostics("single/input", inputTensor)
             runner.run(inputTensor, outputTensor)
-            val reconstructedTile = ImageTensorCodec.postprocess(outputTensor)
+            logTensorDiagnostics("single/output", outputTensor)
+            onProgress(1, 1)
+            val reconstructedTile = ImageTensorCodec.postprocess(outputTensor, normalizationMode = normalizationMode)
             return if (reconstructedTile.width != width || reconstructedTile.height != height) {
                 Bitmap.createScaledBitmap(reconstructedTile, width, height, true)
             } else {
@@ -322,6 +574,8 @@ class VortexCompressionRepository @Inject constructor(
         val stepY = max(1, tileHeight - overlapY)
         val xStarts = tileStarts(width, tileWidth, stepX)
         val yStarts = tileStarts(height, tileHeight, stepY)
+        val totalTiles = xStarts.size * yStarts.size
+        var completedTiles = 0
         val featherX = max(2, min(overlapX / 2, tileWidth / 2))
         val featherY = max(2, min(overlapY / 2, tileHeight / 2))
 
@@ -335,10 +589,24 @@ class VortexCompressionRepository @Inject constructor(
                 val patchWidth = min(tileWidth, width - startX)
                 val patchHeight = min(tileHeight, height - startY)
                 val sourcePatch = Bitmap.createBitmap(sourceBitmap, startX, startY, patchWidth, patchHeight)
-                val inputTensor = ImageTensorCodec.preprocess(sourcePatch, tileWidth, tileHeight, inputSpec.channels)
+                val inputTensor = ImageTensorCodec.preprocess(
+                    bitmap = sourcePatch,
+                    targetWidth = tileWidth,
+                    targetHeight = tileHeight,
+                    channels = inputSpec.channels,
+                    normalizationMode = normalizationMode,
+                )
                 val outputTensor = ImageTensorCodec.outputBuffer(tileHeight, tileWidth, inputSpec.channels)
+                if (startX == 0 && startY == 0) {
+                    logTensorDiagnostics("tile[0,0]/input", inputTensor)
+                }
                 runner.run(inputTensor, outputTensor)
-                val reconstructedTile = ImageTensorCodec.postprocess(outputTensor)
+                if (startX == 0 && startY == 0) {
+                    logTensorDiagnostics("tile[0,0]/output", outputTensor)
+                }
+                completedTiles += 1
+                onProgress(completedTiles, totalTiles)
+                val reconstructedTile = ImageTensorCodec.postprocess(outputTensor, normalizationMode = normalizationMode)
                 val alignedTile = if (patchWidth != tileWidth || patchHeight != tileHeight) {
                     Bitmap.createScaledBitmap(reconstructedTile, patchWidth, patchHeight, true)
                 } else {
@@ -399,22 +667,119 @@ class VortexCompressionRepository @Inject constructor(
     private fun parseImageSpec(shape: IntArray): ImageModelSpec {
         require(shape.size == 4) { "Image model input must be rank-4, got ${shape.contentToString()}" }
         require(shape[0] == 1) { "Image model must use batch size 1, got ${shape[0]}" }
+        val height = resolveModelDim(
+            actual = shape[1],
+            required = REQUIRED_IMAGE_TILE_SIZE,
+            label = "image height",
+        )
+        val width = resolveModelDim(
+            actual = shape[2],
+            required = REQUIRED_IMAGE_TILE_SIZE,
+            label = "image width",
+        )
         require(shape[3] == 3) { "Image model must use RGB channels, got ${shape[3]}" }
-        return ImageModelSpec(height = shape[1], width = shape[2], channels = shape[3])
+        return ImageModelSpec(height = height, width = width, channels = shape[3])
+    }
+
+    private fun acquireImageRunner(delegate: InferenceDelegate): TfliteRunner {
+        synchronized(imageRunnerLock) {
+            val existing = cachedImageRunner
+            if (existing != null && cachedImageRunnerDelegate == delegate) {
+                return existing
+            }
+            existing?.close()
+            return TfliteRunner(context.applicationContext, IMAGE_MODEL_ASSET, delegate).also {
+                cachedImageRunner = it
+                cachedImageRunnerDelegate = delegate
+            }
+        }
+    }
+
+    private fun logTensorDiagnostics(tagSuffix: String, tensor: Array<Array<Array<FloatArray>>>) {
+        val stats = ImageTensorCodec.stats(tensor)
+        val channelSummary = stats.channelMean.indices.joinToString(separator = "; ") { idx ->
+            "c$idx[min=${stats.channelMin[idx]}, max=${stats.channelMax[idx]}, mean=${stats.channelMean[idx]}]"
+        }
+        Log.d(
+            LOG_TAG,
+            "imageTensor[$tagSuffix] shape=[1,${tensor[0].size},${tensor[0][0].size},${tensor[0][0][0].size}] min=${stats.min} max=${stats.max} $channelSummary",
+        )
     }
 
     private fun parseAudioWindow(shape: IntArray): Int {
         require(shape.size == 3) { "Audio model tensor must be rank-3, got ${shape.contentToString()}" }
         require(shape[0] == 1) { "Audio model must use batch size 1, got ${shape[0]}" }
         require(shape[2] == 1) { "Audio model must be mono, got channels=${shape[2]}" }
-        return shape[1]
+        return resolveModelDim(
+            actual = shape[1],
+            required = REQUIRED_AUDIO_WINDOW_SAMPLES,
+            label = "audio window",
+        )
     }
 
     private fun parseVideoSpec(shape: IntArray): VideoModelSpec {
         require(shape.size == 5) { "Video model tensor must be rank-5, got ${shape.contentToString()}" }
         require(shape[0] == 1) { "Video model must use batch size 1, got ${shape[0]}" }
-        require(shape[4] == 3) { "Video model must use RGB channels, got ${shape[4]}" }
-        return VideoModelSpec(frames = shape[1], height = shape[2], width = shape[3], channels = shape[4])
+        val frames = resolveModelDim(
+            actual = shape[1],
+            required = REQUIRED_VIDEO_FRAMES,
+            label = "video frames",
+        )
+        val height = resolveModelDim(
+            actual = shape[2],
+            required = REQUIRED_VIDEO_HEIGHT,
+            label = "video height",
+        )
+        val width = resolveModelDim(
+            actual = shape[3],
+            required = REQUIRED_VIDEO_WIDTH,
+            label = "video width",
+        )
+        require(shape[4] == REQUIRED_VIDEO_CHANNELS) {
+            "Video model must use $REQUIRED_VIDEO_CHANNELS channels, got ${shape[4]}"
+        }
+        return VideoModelSpec(frames = frames, height = height, width = width, channels = shape[4])
+    }
+
+    private fun resolveModelDim(actual: Int, required: Int, label: String): Int {
+        if (actual == required) return required
+        if (actual == 1) {
+            Log.w(LOG_TAG, "Model $label dimension is dynamic placeholder=1; using required=$required")
+            return required
+        }
+        error("Model $label must be $required, got $actual")
+    }
+
+    private fun updatePipeline(
+        mediaType: MediaType,
+        stage: CompressionPipelineStage,
+        progress: Float,
+        startedAtNanos: Long,
+        completedUnits: Int? = null,
+        totalUnits: Int? = null,
+        etaSeconds: Int? = null,
+        message: String? = null,
+    ) {
+        val computedEta = etaSeconds ?: computeEtaSeconds(startedAtNanos, completedUnits, totalUnits)
+        pipelineUpdates.value = CompressionPipelineStatus(
+            mediaType = mediaType,
+            stage = stage,
+            progress = progress.coerceIn(0f, 1f),
+            etaSeconds = computedEta,
+            message = message,
+        )
+    }
+
+    private fun computeEtaSeconds(startedAtNanos: Long, completedUnits: Int?, totalUnits: Int?): Int? {
+        if (completedUnits == null || totalUnits == null || completedUnits <= 0 || completedUnits >= totalUnits) {
+            return null
+        }
+        val elapsedSeconds = (System.nanoTime() - startedAtNanos) / 1_000_000_000.0
+        if (elapsedSeconds <= 0.0) return null
+        val rate = completedUnits / elapsedSeconds
+        if (rate <= 0.0) return null
+        val remaining = (totalUnits - completedUnits) / rate
+        return remaining.toInt().coerceAtLeast(1)
     }
 
     private data class ImageModelSpec(
@@ -431,9 +796,16 @@ class VortexCompressionRepository @Inject constructor(
     )
 
     private companion object {
+        const val LOG_TAG = "VortexCompressionRepo"
+        const val REQUIRED_IMAGE_TILE_SIZE = 32
+        const val REQUIRED_AUDIO_SAMPLE_RATE = 16_000
+        const val REQUIRED_AUDIO_WINDOW_SAMPLES = 8_000
+        const val REQUIRED_VIDEO_FRAMES = 4
+        const val REQUIRED_VIDEO_HEIGHT = 32
+        const val REQUIRED_VIDEO_WIDTH = 32
+        const val REQUIRED_VIDEO_CHANNELS = 3
         const val IMAGE_MODEL_ASSET = "models/image/production_model.tflite"
         const val AUDIO_MODEL_ASSET = "models/audio/audio_autoencoder.tflite"
         const val VIDEO_MODEL_ASSET = "models/video/video_autoencoder.tflite"
     }
 }
-

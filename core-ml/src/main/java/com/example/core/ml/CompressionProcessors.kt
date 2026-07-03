@@ -1,8 +1,10 @@
 package com.example.core.ml
 
 import android.graphics.Bitmap
+import com.example.core.domain.ImageNormalizationMode
 import kotlin.math.log10
 import kotlin.math.max
+import kotlin.math.min
 import androidx.core.graphics.scale
 import androidx.core.graphics.get
 import androidx.core.graphics.createBitmap
@@ -11,11 +13,20 @@ import androidx.core.graphics.set
 object ImageTensorCodec {
     private const val DEFAULT_CHANNELS = 3
 
+    class TensorStats(
+        val min: Float,
+        val max: Float,
+        val channelMin: FloatArray,
+        val channelMax: FloatArray,
+        val channelMean: FloatArray,
+    )
+
     fun preprocess(
         bitmap: Bitmap,
         targetWidth: Int,
         targetHeight: Int,
         channels: Int = DEFAULT_CHANNELS,
+        normalizationMode: ImageNormalizationMode = ImageNormalizationMode.ZERO_ONE,
     ): Array<Array<Array<FloatArray>>> {
         require(channels == DEFAULT_CHANNELS) { "Image codec currently supports RGB channels only" }
         val resized = bitmap.scale(targetWidth, targetHeight)
@@ -24,25 +35,28 @@ object ImageTensorCodec {
                 Array(targetWidth) { x ->
                     val pixel = resized[x, y]
                     floatArrayOf(
-                        ((pixel shr 16) and 0xFF) / 255f,
-                        ((pixel shr 8) and 0xFF) / 255f,
-                        (pixel and 0xFF) / 255f,
+                        normalizeChannel(((pixel shr 16) and 0xFF) / 255f, normalizationMode),
+                        normalizeChannel(((pixel shr 8) and 0xFF) / 255f, normalizationMode),
+                        normalizeChannel((pixel and 0xFF) / 255f, normalizationMode),
                     )
                 }
             }
         }
     }
 
-    fun postprocess(output: Array<Array<Array<FloatArray>>>): Bitmap {
+    fun postprocess(
+        output: Array<Array<Array<FloatArray>>>,
+        normalizationMode: ImageNormalizationMode = ImageNormalizationMode.ZERO_ONE,
+    ): Bitmap {
         val height = output[0].size
         val width = output[0][0].size
         val bitmap = createBitmap(width, height)
         repeat(height) { y ->
             repeat(width) { x ->
                 val rgb = output[0][y][x]
-                val r = (rgb[0].coerceIn(0f, 1f) * 255f).toInt()
-                val g = (rgb[1].coerceIn(0f, 1f) * 255f).toInt()
-                val b = (rgb[2].coerceIn(0f, 1f) * 255f).toInt()
+                val r = (denormalizeChannel(rgb[0], normalizationMode) * 255f).toInt()
+                val g = (denormalizeChannel(rgb[1], normalizationMode) * 255f).toInt()
+                val b = (denormalizeChannel(rgb[2], normalizationMode) * 255f).toInt()
                 val packed = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
                 bitmap[x, y] = packed
             }
@@ -56,6 +70,55 @@ object ImageTensorCodec {
         channels: Int = DEFAULT_CHANNELS,
     ): Array<Array<Array<FloatArray>>> {
         return Array(1) { Array(targetHeight) { Array(targetWidth) { FloatArray(channels) } } }
+    }
+
+    fun stats(tensor: Array<Array<Array<FloatArray>>>): TensorStats {
+        val height = tensor[0].size
+        val width = tensor[0][0].size
+        val channels = tensor[0][0][0].size
+        var minValue = Float.POSITIVE_INFINITY
+        var maxValue = Float.NEGATIVE_INFINITY
+        val channelMin = FloatArray(channels) { Float.POSITIVE_INFINITY }
+        val channelMax = FloatArray(channels) { Float.NEGATIVE_INFINITY }
+        val channelSum = FloatArray(channels)
+        val total = (height * width).coerceAtLeast(1)
+        repeat(height) { y ->
+            repeat(width) { x ->
+                val values = tensor[0][y][x]
+                repeat(channels) { c ->
+                    val value = values[c]
+                    minValue = min(minValue, value)
+                    maxValue = max(maxValue, value)
+                    channelMin[c] = min(channelMin[c], value)
+                    channelMax[c] = max(channelMax[c], value)
+                    channelSum[c] += value
+                }
+            }
+        }
+        val channelMean = FloatArray(channels) { index -> channelSum[index] / total.toFloat() }
+        return TensorStats(
+            min = minValue,
+            max = maxValue,
+            channelMin = channelMin,
+            channelMax = channelMax,
+            channelMean = channelMean,
+        )
+    }
+
+    private fun normalizeChannel(valueZeroOne: Float, mode: ImageNormalizationMode): Float {
+        val bounded = valueZeroOne.coerceIn(0f, 1f)
+        return when (mode) {
+            ImageNormalizationMode.ZERO_ONE -> bounded
+            ImageNormalizationMode.NEG_ONE_ONE -> (bounded * 2f) - 1f
+        }
+    }
+
+    private fun denormalizeChannel(value: Float, mode: ImageNormalizationMode): Float {
+        val zeroOne = when (mode) {
+            ImageNormalizationMode.ZERO_ONE -> value
+            ImageNormalizationMode.NEG_ONE_ONE -> (value + 1f) * 0.5f
+        }
+        return zeroOne.coerceIn(0f, 1f)
     }
 }
 

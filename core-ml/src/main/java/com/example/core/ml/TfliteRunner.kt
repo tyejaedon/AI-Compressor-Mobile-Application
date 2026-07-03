@@ -50,6 +50,9 @@ class TfliteRunner(
     }
 
     fun run(input: Any, output: Any) {
+        if (input is Array<*>) {
+            resizeInputIfNeeded(inferArrayShape(input))
+        }
         validate(
             inputTensor = interpreter.getInputTensor(0),
             outputTensor = interpreter.getOutputTensor(0),
@@ -57,6 +60,23 @@ class TfliteRunner(
             output = output,
         )
         interpreter.run(input, output)
+    }
+
+    private fun resizeInputIfNeeded(inputShape: IntArray) {
+        val inputTensor = interpreter.getInputTensor(0)
+        val currentShape = inputTensor.shape()
+        if (inputShape.contentEquals(currentShape)) return
+
+        val signature = inputTensor.shapeSignature()
+        val canResize = signature.size == inputShape.size && signature.indices.all { idx ->
+            val dim = signature[idx]
+            dim == -1 || dim == inputShape[idx]
+        }
+        require(canResize) {
+            "Input shape mismatch. expected=${currentShape.contentToString()} signature=${signature.contentToString()} actual=${inputShape.contentToString()}"
+        }
+        interpreter.resizeInput(0, inputShape)
+        interpreter.allocateTensors()
     }
 
     private fun validate(inputTensor: Tensor, outputTensor: Tensor, input: Any, output: Any) {
