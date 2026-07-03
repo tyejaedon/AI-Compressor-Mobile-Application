@@ -1,5 +1,6 @@
 plugins {
     alias(libs.plugins.android.library)
+    alias(libs.plugins.ksp)
 }
 
 android {
@@ -21,12 +22,17 @@ android {
     }
 }
 
+ksp {
+    arg("room.generateKotlin", "false")
+}
+
 dependencies {
     api(project(":core-domain"))
     implementation(project(":core-ml"))
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.room.runtime)
     implementation(libs.androidx.room.ktx)
+    ksp(libs.androidx.room.compiler)
     implementation(libs.androidx.datastore)
     implementation(libs.androidx.work.runtime.ktx)
     implementation(libs.hilt.android)
@@ -35,4 +41,3 @@ dependencies {
     testImplementation(libs.junit)
     testImplementation(libs.mockk)
 }
-
