@@ -25,6 +25,7 @@ dependencies {
     api(project(":core-domain"))
     implementation(libs.androidx.core.ktx)
     implementation(libs.kotlinx.coroutines.android)
+    api(libs.tensorflow.lite.api)
     implementation(libs.tensorflow.lite)
     implementation(libs.tensorflow.lite.gpu)
     testImplementation(libs.junit)

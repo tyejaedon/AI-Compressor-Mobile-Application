@@ -22,11 +22,21 @@ import com.example.core.domain.ImageNormalizationMode
 import com.example.core.domain.InferenceDelegate
 import com.example.core.domain.MediaType
 import com.example.core.domain.ModelMetadata
+import com.example.core.data.container.AicContainer
+import com.example.core.domain.AicCompressionAlgo
+import com.example.core.domain.AicContainerInspection
+import com.example.core.domain.AicHeader
+import com.example.core.domain.AicModality
+import com.example.core.domain.CompressionSettings
+import com.example.core.ml.AudioCompressionEngine
 import com.example.core.ml.AudioTensorCodec
 import com.example.core.ml.CompressionMetricsCalculator
+import com.example.core.ml.ImageCompressionEngine
 import com.example.core.ml.ImageTensorCodec
+import com.example.core.ml.MetricsCalculator
 import com.example.core.ml.ModelReportParser
 import com.example.core.ml.TfliteRunner
+import com.example.core.ml.UpscalerEngine
 import com.example.core.ml.VideoTensorCodec
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -42,6 +52,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import androidx.core.graphics.createBitmap
+
 
 @Singleton
 class VortexCompressionRepository @Inject constructor(
@@ -159,6 +170,362 @@ class VortexCompressionRepository @Inject constructor(
             )
         }
     }
+
+    override suspend fun compressImageToAic(
+        uri: Uri,
+        settings: CompressionSettings,
+    ): Result<CompressionResult> = withContext(ioDispatcher) {
+        val startedAtNanos = System.nanoTime()
+        updatePipeline(
+            mediaType = MediaType.IMAGE,
+            stage = CompressionPipelineStage.VALIDATING_INPUT,
+            progress = 0.05f,
+            startedAtNanos = startedAtNanos,
+        )
+        runCatching {
+            validator.validateImage(uri).getOrThrow()
+            updatePipeline(
+                mediaType = MediaType.IMAGE,
+                stage = CompressionPipelineStage.LOADING_SOURCE,
+                progress = 0.12f,
+                startedAtNanos = startedAtNanos,
+            )
+            val sourceBitmap = mediaIo.readBitmap(uri)
+            val originalSizeBytes = mediaIo.getFileSizeBytes(uri).let { if (it > 0) it else (sourceBitmap.byteCount.toLong()) }
+
+            updatePipeline(
+                mediaType = MediaType.IMAGE,
+                stage = CompressionPipelineStage.PREPARING_MODEL,
+                progress = 0.25f,
+                startedAtNanos = startedAtNanos,
+            )
+
+            val engine = ImageCompressionEngine(
+                context = context,
+                requestedDelegate = settings.delegate,
+                threads = settings.threads,
+            )
+
+            updatePipeline(
+                mediaType = MediaType.IMAGE,
+                stage = CompressionPipelineStage.RUNNING_INFERENCE,
+                progress = 0.50f,
+                startedAtNanos = startedAtNanos,
+            )
+
+            var latencyNanos: Long
+            val latentResult: ImageCompressionEngine.LatentResult
+            var reconstructed: Bitmap
+            engine.use { eng ->
+                latencyNanos = measureNanoTime {
+                    latentResult = eng.encodeBitmap(sourceBitmap, bitDepth = settings.bitDepth)
+                }
+
+                val bos = java.io.ByteArrayOutputStream()
+                AicContainer.write(
+                    out = bos,
+                    modality = AicModality.IMAGE,
+                    width = latentResult.originalWidth,
+                    height = latentResult.originalHeight,
+                    latentH = latentResult.latentH,
+                    latentW = latentResult.latentW,
+                    latentChannels = latentResult.latentChannels,
+                    bitDepth = latentResult.bitDepth,
+                    algo = settings.compressionAlgo,
+                    rawLatentBytes = latentResult.quantizedBytes,
+                )
+                val aicBytes = bos.toByteArray()
+                val aicUri = mediaIo.saveAicBytes(aicBytes, "image-aic")
+
+                updatePipeline(
+                    mediaType = MediaType.IMAGE,
+                    stage = CompressionPipelineStage.SAVING_OUTPUT,
+                    progress = 0.75f,
+                    startedAtNanos = startedAtNanos,
+                )
+
+                var recon = eng.decodeLatents(
+                    quantizedBytes = latentResult.quantizedBytes,
+                    originalWidth = latentResult.originalWidth,
+                    originalHeight = latentResult.originalHeight,
+                    latentH = latentResult.latentH,
+                    latentW = latentResult.latentW,
+                    latentChannels = latentResult.latentChannels,
+                    bitDepth = latentResult.bitDepth,
+                )
+
+                if (settings.enableSuperResolution) {
+                    val upscaler = UpscalerEngine(context, requestedDelegate = settings.delegate, threads = settings.threads)
+                    upscaler.use { sr ->
+                        recon = sr.upscale(recon)
+                    }
+                }
+                reconstructed = recon
+
+                updatePipeline(
+                    mediaType = MediaType.IMAGE,
+                    stage = CompressionPipelineStage.CALCULATING_METRICS,
+                    progress = 0.90f,
+                    startedAtNanos = startedAtNanos,
+                )
+
+                val previewUri = mediaIo.saveBitmap(reconstructed, "image-aic-preview")
+                val compressedSizeBytes = aicBytes.size.toLong()
+                val ratio = if (compressedSizeBytes > 0) originalSizeBytes.toDouble() / compressedSizeBytes.toDouble() else 1.0
+                val savings = MetricsCalculator.calculateStorageSavings(originalSizeBytes, compressedSizeBytes)
+                val psnrVal = MetricsCalculator.calculateBitmapPsnr(sourceBitmap, reconstructed)
+                val ssimVal = MetricsCalculator.calculateBitmapSsim(sourceBitmap, reconstructed)
+                val bpp = MetricsCalculator.calculateBitsPerPixel(compressedSizeBytes, sourceBitmap.width, sourceBitmap.height)
+                val latencyMs = latencyNanos / 1_000_000.0
+
+                val metrics = CompressionMetrics(
+                    psnr = psnrVal,
+                    ssim = ssimVal,
+                    snr = null,
+                    compressionRatio = ratio,
+                    latencyMs = latencyMs,
+                    throughputItemsPerSec = if (latencyMs > 0) 1000.0 / latencyMs else 0.0,
+                    bitsPerPixel = bpp,
+                )
+
+                storeHistory(uri, aicUri, MediaType.IMAGE, metrics)
+                updatePipeline(
+                    mediaType = MediaType.IMAGE,
+                    stage = CompressionPipelineStage.COMPLETED,
+                    progress = 1.0f,
+                    startedAtNanos = startedAtNanos,
+                    etaSeconds = 0,
+                )
+
+                CompressionResult(
+                    inputUri = uri,
+                    outputUri = aicUri,
+                    previewUri = previewUri,
+                    metrics = metrics,
+                    originalSizeBytes = originalSizeBytes,
+                    compressedSizeBytes = compressedSizeBytes,
+                    storageSavingsPercent = savings,
+                    bitsPerPixel = bpp,
+                )
+            }
+        }.onFailure { throwable ->
+            updatePipeline(
+                mediaType = MediaType.IMAGE,
+                stage = CompressionPipelineStage.FAILED,
+                progress = 1f,
+                startedAtNanos = startedAtNanos,
+                message = throwable.message ?: "AIC Image compression failed",
+            )
+        }
+    }
+
+    override suspend fun decompressAicFile(
+        aicUri: Uri,
+        enableSuperResolution: Boolean,
+    ): Result<CompressionResult> = withContext(ioDispatcher) {
+        val startedAtNanos = System.nanoTime()
+        runCatching {
+            val (header, rawLatents) = mediaIo.openAicInputStream(aicUri).use { AicContainer.read(it) }
+            val aicSize = mediaIo.getFileSizeBytes(aicUri)
+
+            when (header.modality) {
+                AicModality.IMAGE -> {
+                    val engine = ImageCompressionEngine(context)
+                    var bitmap = engine.use {
+                        it.decodeLatents(
+                            quantizedBytes = rawLatents,
+                            originalWidth = header.originalWidth,
+                            originalHeight = header.originalHeight,
+                            latentH = header.latentH,
+                            latentW = header.latentW,
+                            latentChannels = header.latentChannels,
+                            bitDepth = header.bitDepth.toInt(),
+                        )
+                    }
+                    if (enableSuperResolution) {
+                        UpscalerEngine(context).use { sr ->
+                            bitmap = sr.upscale(bitmap)
+                        }
+                    }
+                    val previewUri = mediaIo.saveBitmap(bitmap, "decompressed-image")
+                    val bpp = MetricsCalculator.calculateBitsPerPixel(aicSize, header.originalWidth, header.originalHeight)
+                    CompressionResult(
+                        inputUri = aicUri,
+                        outputUri = aicUri,
+                        previewUri = previewUri,
+                        metrics = CompressionMetrics(
+                            compressionRatio = 1.0,
+                            latencyMs = (System.nanoTime() - startedAtNanos) / 1_000_000.0,
+                            throughputItemsPerSec = 1.0,
+                            bitsPerPixel = bpp,
+                        ),
+                        originalSizeBytes = aicSize,
+                        compressedSizeBytes = aicSize,
+                        storageSavingsPercent = 0.0,
+                        bitsPerPixel = bpp,
+                    )
+                }
+                AicModality.AUDIO -> {
+                    val engine = AudioCompressionEngine(context)
+                    val samples = engine.use {
+                        it.decodeAudio(
+                            quantizedBytes = rawLatents,
+                            totalSampleCount = header.originalWidth,
+                            bitDepth = header.bitDepth.toInt(),
+                        )
+                    }
+                    val previewUri = mediaIo.writeWavMonoFloat(samples, "decompressed-audio", header.originalHeight)
+                    CompressionResult(
+                        inputUri = aicUri,
+                        outputUri = aicUri,
+                        previewUri = previewUri,
+                        metrics = CompressionMetrics(
+                            compressionRatio = 1.0,
+                            latencyMs = (System.nanoTime() - startedAtNanos) / 1_000_000.0,
+                            throughputItemsPerSec = 1.0,
+                        ),
+                        originalSizeBytes = aicSize,
+                        compressedSizeBytes = aicSize,
+                    )
+                }
+                AicModality.VIDEO -> {
+                    error("Video decompression from AIC container is not implemented yet")
+                }
+            }
+        }
+    }
+
+    override suspend fun inspectAicFile(aicUri: Uri): Result<AicContainerInspection> = withContext(ioDispatcher) {
+        runCatching {
+            val header = mediaIo.openAicInputStream(aicUri).use { AicContainer.readHeader(it) }
+            val fileSizeBytes = mediaIo.getFileSizeBytes(aicUri)
+            val uncompressedLatents = (header.latentH.toLong() * header.latentW * header.latentChannels * (header.bitDepth / 8.0)).toLong().coerceAtLeast(1L)
+            val ratio = if (fileSizeBytes > 0) uncompressedLatents.toDouble() / fileSizeBytes.toDouble() else 1.0
+            val savings = if (uncompressedLatents > 0) ((uncompressedLatents - fileSizeBytes).toDouble() / uncompressedLatents.toDouble() * 100.0).coerceIn(0.0, 100.0) else 0.0
+            val bpp = if (header.modality == AicModality.IMAGE && header.originalWidth > 0 && header.originalHeight > 0) {
+                MetricsCalculator.calculateBitsPerPixel(fileSizeBytes, header.originalWidth, header.originalHeight)
+            } else null
+
+            AicContainerInspection(
+                header = header,
+                fileSizeBytes = fileSizeBytes,
+                uncompressedLatentBytes = uncompressedLatents,
+                compressionRatio = ratio,
+                storageSavingsPercent = savings,
+                estimatedBpp = bpp,
+            )
+        }
+    }
+
+    override suspend fun compressAudioToAic(
+        uri: Uri,
+        settings: CompressionSettings,
+    ): Result<CompressionResult> = withContext(ioDispatcher) {
+        val startedAtNanos = System.nanoTime()
+        updatePipeline(
+            mediaType = MediaType.AUDIO,
+            stage = CompressionPipelineStage.VALIDATING_INPUT,
+            progress = 0.05f,
+            startedAtNanos = startedAtNanos,
+        )
+        runCatching {
+            validator.validateAudio(uri).getOrThrow()
+            updatePipeline(
+                mediaType = MediaType.AUDIO,
+                stage = CompressionPipelineStage.LOADING_SOURCE,
+                progress = 0.15f,
+                startedAtNanos = startedAtNanos,
+            )
+            val sourceSamples = mediaIo.readWavMonoFloat(uri)
+            val originalSizeBytes = mediaIo.getFileSizeBytes(uri).let { if (it > 0) it else (sourceSamples.size * 2L + 44L) }
+
+            updatePipeline(
+                mediaType = MediaType.AUDIO,
+                stage = CompressionPipelineStage.PREPARING_MODEL,
+                progress = 0.30f,
+                startedAtNanos = startedAtNanos,
+            )
+            val engine = AudioCompressionEngine(context, requestedDelegate = settings.delegate, threads = settings.threads)
+            engine.use { eng ->
+                updatePipeline(
+                    mediaType = MediaType.AUDIO,
+                    stage = CompressionPipelineStage.RUNNING_INFERENCE,
+                    progress = 0.60f,
+                    startedAtNanos = startedAtNanos,
+                )
+                val encoded = eng.encodeAudio(sourceSamples, bitDepth = settings.bitDepth)
+                val latencyNanos = System.nanoTime() - startedAtNanos
+
+                val bos = java.io.ByteArrayOutputStream()
+                AicContainer.write(
+                    out = bos,
+                    modality = AicModality.AUDIO,
+                    width = encoded.totalSampleCount,
+                    height = REQUIRED_AUDIO_SAMPLE_RATE,
+                    latentH = encoded.windowCount,
+                    latentW = eng.windowSize,
+                    latentChannels = 1,
+                    bitDepth = encoded.bitDepth,
+                    algo = settings.compressionAlgo,
+                    rawLatentBytes = encoded.quantizedBytes,
+                )
+                val aicBytes = bos.toByteArray()
+                val aicUri = mediaIo.saveAicBytes(aicBytes, "audio-aic")
+
+                updatePipeline(
+                    mediaType = MediaType.AUDIO,
+                    stage = CompressionPipelineStage.SAVING_OUTPUT,
+                    progress = 0.85f,
+                    startedAtNanos = startedAtNanos,
+                )
+                val restoredSamples = eng.decodeAudio(encoded.quantizedBytes, encoded.totalSampleCount, encoded.bitDepth)
+                val previewUri = mediaIo.writeWavMonoFloat(restoredSamples, "audio-aic-preview", REQUIRED_AUDIO_SAMPLE_RATE)
+
+                val snrVal = MetricsCalculator.calculateAudioSnr(sourceSamples, restoredSamples)
+                val compressedSizeBytes = aicBytes.size.toLong()
+                val ratio = if (compressedSizeBytes > 0) originalSizeBytes.toDouble() / compressedSizeBytes.toDouble() else 1.0
+                val savings = MetricsCalculator.calculateStorageSavings(originalSizeBytes, compressedSizeBytes)
+                val latencyMs = latencyNanos / 1_000_000.0
+
+                val metrics = CompressionMetrics(
+                    psnr = null,
+                    ssim = null,
+                    snr = snrVal,
+                    compressionRatio = ratio,
+                    latencyMs = latencyMs,
+                    throughputItemsPerSec = if (latencyMs > 0) 1000.0 / latencyMs else 0.0,
+                )
+
+                storeHistory(uri, aicUri, MediaType.AUDIO, metrics)
+                updatePipeline(
+                    mediaType = MediaType.AUDIO,
+                    stage = CompressionPipelineStage.COMPLETED,
+                    progress = 1.0f,
+                    startedAtNanos = startedAtNanos,
+                    etaSeconds = 0,
+                )
+
+                CompressionResult(
+                    inputUri = uri,
+                    outputUri = aicUri,
+                    previewUri = previewUri,
+                    metrics = metrics,
+                    originalSizeBytes = originalSizeBytes,
+                    compressedSizeBytes = compressedSizeBytes,
+                    storageSavingsPercent = savings,
+                )
+            }
+        }.onFailure { throwable ->
+            updatePipeline(
+                mediaType = MediaType.AUDIO,
+                stage = CompressionPipelineStage.FAILED,
+                progress = 1f,
+                startedAtNanos = startedAtNanos,
+                message = throwable.message ?: "AIC Audio compression failed",
+            )
+        }
+    }
+
 
     override suspend fun compressAudio(uri: Uri): Result<CompressionResult> = withContext(ioDispatcher) {
         val startedAtNanos = System.nanoTime()

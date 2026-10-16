@@ -33,3 +33,31 @@ class ObserveBatchProgressUseCase @Inject constructor(
     operator fun invoke() = repository.batchProgress()
 }
 
+class CompressImageToAicUseCase @Inject constructor(
+    private val repository: CompressionRepository,
+) {
+    suspend operator fun invoke(uri: Uri, settings: CompressionSettings = CompressionSettings()) =
+        repository.compressImageToAic(uri, settings)
+}
+
+class DecompressAicFileUseCase @Inject constructor(
+    private val repository: CompressionRepository,
+) {
+    suspend operator fun invoke(aicUri: Uri, enableSuperResolution: Boolean = false) =
+        repository.decompressAicFile(aicUri, enableSuperResolution)
+}
+
+class InspectAicFileUseCase @Inject constructor(
+    private val repository: CompressionRepository,
+) {
+    suspend operator fun invoke(aicUri: Uri) = repository.inspectAicFile(aicUri)
+}
+
+class CompressAudioToAicUseCase @Inject constructor(
+    private val repository: CompressionRepository,
+) {
+    suspend operator fun invoke(uri: Uri, settings: CompressionSettings = CompressionSettings()) =
+        repository.compressAudioToAic(uri, settings)
+}
+
+

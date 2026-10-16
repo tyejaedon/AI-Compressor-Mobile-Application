@@ -4,20 +4,39 @@ import android.content.Intent
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -27,16 +46,21 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
-import coil.compose.AsyncImage
-import java.util.Locale
+import com.example.core.domain.InferenceDelegate
+import com.example.core.ui.AicInspectionCard
+import com.example.core.ui.BeforeAfterSlider
+import com.example.core.ui.FileSizeComparisonCard
+import com.example.core.ui.SamsungHeader
 import kotlinx.coroutines.launch
-import com.example.core.domain.ImageNormalizationMode
-import com.example.core.ui.CompressorCard
-import com.example.core.ui.MetricsRow
 
 @Composable
 fun ImageCompressionRoute(
@@ -46,34 +70,70 @@ fun ImageCompressionRoute(
     val state by viewModel.uiState.collectAsState()
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var pendingSaveUri by remember { mutableStateOf<Uri?>(null) }
-    val saveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("image/png")) { destination ->
-        val source = pendingSaveUri
+
+    var pendingSaveAicUri by remember { mutableStateOf<Uri?>(null) }
+    var pendingSavePngUri by remember { mutableStateOf<Uri?>(null) }
+
+    // SAF Document Creators
+    val saveAicLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/octet-stream"),
+    ) { destination ->
+        val source = pendingSaveAicUri
         if (destination != null && source != null) {
             runCatching {
                 context.contentResolver.openInputStream(source).use { input ->
-                    requireNotNull(input) { "Unable to open compressed image" }
+                    requireNotNull(input)
                     context.contentResolver.openOutputStream(destination).use { output ->
-                        requireNotNull(output) { "Unable to open destination" }
+                        requireNotNull(output)
                         input.copyTo(output)
                     }
                 }
             }.onSuccess {
-                scope.launch { snackbarHostState.showSnackbar("Image saved to device") }
+                scope.launch { snackbarHostState.showSnackbar("AIC compressed file saved successfully!") }
+            }.onFailure {
+                scope.launch { snackbarHostState.showSnackbar("Failed to export AIC file") }
+            }
+        }
+        pendingSaveAicUri = null
+    }
+
+    val savePngLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("image/png"),
+    ) { destination ->
+        val source = pendingSavePngUri
+        if (destination != null && source != null) {
+            runCatching {
+                context.contentResolver.openInputStream(source).use { input ->
+                    requireNotNull(input)
+                    context.contentResolver.openOutputStream(destination).use { output ->
+                        requireNotNull(output)
+                        input.copyTo(output)
+                    }
+                }
+            }.onSuccess {
+                scope.launch { snackbarHostState.showSnackbar("Reconstructed PNG saved to gallery!") }
             }.onFailure {
                 scope.launch { snackbarHostState.showSnackbar("Failed to save image") }
             }
         }
-        pendingSaveUri = null
+        pendingSavePngUri = null
     }
+
     ImageCompressionScreen(
         state = state,
         onPickImage = viewModel::onImageSelected,
-        onCompress = viewModel::compress,
-        onNormalizationModeChanged = viewModel::setImageNormalizationMode,
-        onSaveToDevice = { uri ->
-            pendingSaveUri = uri
-            saveLauncher.launch("compressed-image-${System.currentTimeMillis()}.png")
+        onPickAicFile = viewModel::onAicFileSelected,
+        onCompressToAic = viewModel::compressToAic,
+        onToggleSuperResolution = viewModel::toggleSuperResolution,
+        onSetBitDepth = viewModel::setBitDepth,
+        onSetDelegate = viewModel::setDelegate,
+        onExportAic = { uri ->
+            pendingSaveAicUri = uri
+            saveAicLauncher.launch("compressed-media-${System.currentTimeMillis()}.aic")
+        },
+        onSavePng = { uri ->
+            pendingSavePngUri = uri
+            savePngLauncher.launch("reconstructed-${System.currentTimeMillis()}.png")
         },
         onShare = { uri ->
             val sendIntent = Intent(Intent.ACTION_SEND).apply {
@@ -81,7 +141,7 @@ fun ImageCompressionRoute(
                 putExtra(Intent.EXTRA_STREAM, uri)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
-            context.startActivity(Intent.createChooser(sendIntent, "Share compressed image"))
+            context.startActivity(Intent.createChooser(sendIntent, "Share Reconstructed Image"))
         },
     )
 
@@ -96,141 +156,288 @@ fun ImageCompressionRoute(
 @Composable
 private fun ImageCompressionScreen(
     state: ImageCompressionUiState,
-    onPickImage: (android.net.Uri) -> Unit,
-    onCompress: () -> Unit,
-    onNormalizationModeChanged: (ImageNormalizationMode) -> Unit,
-    onSaveToDevice: (android.net.Uri) -> Unit,
-    onShare: (android.net.Uri) -> Unit,
+    onPickImage: (Uri) -> Unit,
+    onPickAicFile: (Uri) -> Unit,
+    onCompressToAic: () -> Unit,
+    onToggleSuperResolution: (Boolean) -> Unit,
+    onSetBitDepth: (Int) -> Unit,
+    onSetDelegate: (InferenceDelegate) -> Unit,
+    onExportAic: (Uri) -> Unit,
+    onSavePng: (Uri) -> Unit,
+    onShare: (Uri) -> Unit,
 ) {
-    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        uri?.let(onPickImage)
-    }
+    val imagePickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri -> uri?.let(onPickImage) }
+
+    val aicPickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri -> uri?.let(onPickAicFile) }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(16.dp)
+            .padding(horizontal = 16.dp)
             .verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        CompressorCard(title = "Image Compressor", subtitle = "32x32 RGB autoencoder reconstruction") {
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Button(onClick = { launcher.launch(arrayOf("image/*")) }) {
-                    Text("Import")
-                }
-                Button(onClick = onCompress, enabled = state.sourceUri != null && !state.isLoading) {
-                    Text("Compress")
-                }
-                Button(onClick = { state.result?.outputUri?.let(onShare) }, enabled = state.result != null) {
-                    Text("Share")
-                }
-                Button(onClick = { state.result?.outputUri?.let(onSaveToDevice) }, enabled = state.result != null) {
-                    Text("Save")
-                }
-            }
-            if (state.isLoading) {
-                CircularProgressIndicator(modifier = Modifier.padding(top = 8.dp))
-            }
-            Text(
-                text = "Normalization",
-                style = MaterialTheme.typography.labelLarge,
-                modifier = Modifier.padding(top = 8.dp),
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                val zeroOneSelected = state.normalizationMode == ImageNormalizationMode.ZERO_ONE
-                if (zeroOneSelected) {
-                    Button(onClick = { onNormalizationModeChanged(ImageNormalizationMode.ZERO_ONE) }) {
-                        Text("0..1")
-                    }
-                } else {
-                    OutlinedButton(onClick = { onNormalizationModeChanged(ImageNormalizationMode.ZERO_ONE) }) {
-                        Text("0..1")
-                    }
-                }
-
-                val negOneOneSelected = state.normalizationMode == ImageNormalizationMode.NEG_ONE_ONE
-                if (negOneOneSelected) {
-                    Button(onClick = { onNormalizationModeChanged(ImageNormalizationMode.NEG_ONE_ONE) }) {
-                        Text("-1..1")
-                    }
-                } else {
-                    OutlinedButton(onClick = { onNormalizationModeChanged(ImageNormalizationMode.NEG_ONE_ONE) }) {
-                        Text("-1..1")
-                    }
-                }
-            }
-        }
-
-        state.pipelineStatus?.let { status ->
-            CompressorCard(title = "Compression Pipeline", subtitle = "Realtime stage progress") {
-                LinearProgressIndicator(
-                    progress = { status.progress },
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                Text(
-                    text = "Stage: ${status.stage.name.replace('_', ' ').lowercase().replaceFirstChar { it.uppercase() }}",
-                    modifier = Modifier.padding(top = 8.dp),
-                )
-                Text(
-                    text = if (status.etaSeconds != null) {
-                        "Estimated time remaining: ${status.etaSeconds}s"
-                    } else {
-                        "Estimated time remaining: calculating..."
-                    },
-                )
-                status.message?.let { message ->
-                    Text(text = message, color = MaterialTheme.colorScheme.error)
-                }
-                if (state.pipelineTimeline.isNotEmpty()) {
-                    Text(
-                        text = "Timeline",
-                        style = MaterialTheme.typography.labelLarge,
-                        modifier = Modifier.padding(top = 8.dp),
-                    )
-                    state.pipelineTimeline.takeLast(8).forEach { line ->
-                        Text(text = "- $line")
-                    }
-                }
-            }
-        }
-
-        Text(text = "Comparison", style = MaterialTheme.typography.titleMedium)
-        Text(
-            text = "Original and reconstructed images are shown side-by-side for direct comparison.",
-            style = MaterialTheme.typography.bodySmall,
+        SamsungHeader(
+            title = "Neural Image Studio",
+            subtitle = "Edge-quantized autoencoder compression with 2x sub-pixel CNN remaster",
         )
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text(text = "Original", style = MaterialTheme.typography.labelMedium)
-                AsyncImage(
-                    model = state.sourceUri,
-                    contentDescription = "Original image",
-                )
+
+        // Interactive Before/After Split Viewer
+        BeforeAfterSlider(
+            originalBitmap = state.sourceBitmap,
+            reconstructedBitmap = state.reconstructedBitmap,
+            heightDp = 300,
+        )
+
+        // Quick Action Pill Bar
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Button(
+                onClick = { imagePickerLauncher.launch(arrayOf("image/*")) },
+                shape = RoundedCornerShape(16.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+                    contentColor = MaterialTheme.colorScheme.onSurface,
+                ),
+                modifier = Modifier.weight(1f),
+            ) {
+                Text("Import Photo", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
             }
-            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text(text = "Reconstructed", style = MaterialTheme.typography.labelMedium)
-                AsyncImage(
-                    model = state.result?.outputUri,
-                    contentDescription = "Reconstructed image",
-                )
+
+            Button(
+                onClick = onCompressToAic,
+                enabled = state.sourceUri != null && !state.isLoading,
+                shape = RoundedCornerShape(16.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.primary,
+                    contentColor = MaterialTheme.colorScheme.onPrimary,
+                ),
+                modifier = Modifier.weight(1.2f),
+            ) {
+                if (state.isLoading) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.onPrimary,
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Compressing...", fontSize = 13.sp)
+                } else {
+                    Text("Compress (.aic)", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                }
+            }
+
+            OutlinedButton(
+                onClick = { aicPickerLauncher.launch(arrayOf("*/*")) },
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.weight(0.9f),
+            ) {
+                Text("Open .aic", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
             }
         }
 
+        // Export and Share Row (when result is available)
+        AnimatedVisibility(visible = state.result != null) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                state.result?.outputUri?.let { aicUri ->
+                    Button(
+                        onClick = { onExportAic(aicUri) },
+                        shape = RoundedCornerShape(16.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary),
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Text("Export .aic", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    }
+                }
+
+                state.result?.previewUri?.let { previewUri ->
+                    OutlinedButton(
+                        onClick = { onSavePng(previewUri) },
+                        shape = RoundedCornerShape(16.dp),
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Text("Save PNG", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                    }
+
+                    OutlinedButton(
+                        onClick = { onShare(previewUri) },
+                        shape = RoundedCornerShape(16.dp),
+                        modifier = Modifier.weight(0.8f),
+                    ) {
+                        Text("Share", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                    }
+                }
+            }
+        }
+
+        // Real-Time Pipeline Progress Indicator
+        state.pipelineStatus?.let { status ->
+            if (status.stage != com.example.core.domain.CompressionPipelineStage.COMPLETED) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(22.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = "PIPELINE: ${status.stage.name.replace('_', ' ')}",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary,
+                            )
+                            Text(
+                                text = "${(status.progress * 100).toInt()}%",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(8.dp))
+                        LinearProgressIndicator(
+                            progress = { status.progress },
+                            modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
+                        )
+                    }
+                }
+            }
+        }
+
+        // Storage Benchmark Card
         state.result?.let { result ->
-            MetricsRow(
-                metrics = listOf(
-                    "PSNR" to String.format(Locale.US, "%.2f", result.metrics.psnr ?: 0.0),
-                    "SSIM" to String.format(Locale.US, "%.3f", result.metrics.ssim ?: 0.0),
-                    "Latency" to String.format(Locale.US, "%.2f ms", result.metrics.latencyMs),
-                ),
-            )
-            MetricsRow(
-                metrics = listOf(
-                    "Ratio" to String.format(Locale.US, "%.2fx", result.metrics.compressionRatio),
-                    "Throughput" to String.format(Locale.US, "%.2f/s", result.metrics.throughputItemsPerSec),
-                ),
+            FileSizeComparisonCard(
+                originalSizeBytes = result.originalSizeBytes,
+                compressedSizeBytes = result.compressedSizeBytes,
+                psnrVal = result.metrics.psnr,
+                ssimVal = result.metrics.ssim,
+                latencyMs = result.metrics.latencyMs,
+                bitsPerPixel = result.bitsPerPixel,
+                superResolutionActive = state.settings.enableSuperResolution,
+                delegateLabel = state.settings.delegate.name,
             )
         }
+
+        // AIC Container Inspection (if inspecting .aic)
+        state.inspection?.let { inspection ->
+            AicInspectionCard(inspection = inspection)
+        }
+
+        // Neural Engine Tuning & Configuration Card
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(26.dp),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHighest),
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                Text(
+                    text = "NEURAL ENGINE PARAMETERS",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    letterSpacing = 1.1.sp,
+                )
+
+                // 2x ESPCN Learned Super-Resolution Remaster Switch
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "2x ESPCN Super-Resolution Remaster",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Text(
+                            text = "Enhances edges and sub-pixel details on reconstruction",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(
+                        checked = state.settings.enableSuperResolution,
+                        onCheckedChange = onToggleSuperResolution,
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = MaterialTheme.colorScheme.primary,
+                        ),
+                    )
+                }
+
+                // Discretization Bit Depth
+                Column {
+                    Text(
+                        text = "Discretization Bit Depth",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(
+                            selected = state.settings.bitDepth == 8,
+                            onClick = { onSetBitDepth(8) },
+                            label = { Text("8-bit (Best Fidelity)") },
+                            shape = RoundedCornerShape(12.dp),
+                        )
+                        FilterChip(
+                            selected = state.settings.bitDepth == 6,
+                            onClick = { onSetBitDepth(6) },
+                            label = { Text("6-bit (Max Compression)") },
+                            shape = RoundedCornerShape(12.dp),
+                        )
+                    }
+                }
+
+                // Hardware Acceleration Delegate
+                Column {
+                    Text(
+                        text = "Inference Hardware Acceleration",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(
+                            selected = state.settings.delegate == InferenceDelegate.GPU,
+                            onClick = { onSetDelegate(InferenceDelegate.GPU) },
+                            label = { Text("GPU / Metal") },
+                            shape = RoundedCornerShape(12.dp),
+                        )
+                        FilterChip(
+                            selected = state.settings.delegate == InferenceDelegate.NNAPI,
+                            onClick = { onSetDelegate(InferenceDelegate.NNAPI) },
+                            label = { Text("NNAPI") },
+                            shape = RoundedCornerShape(12.dp),
+                        )
+                        FilterChip(
+                            selected = state.settings.delegate == InferenceDelegate.CPU,
+                            onClick = { onSetDelegate(InferenceDelegate.CPU) },
+                            label = { Text("CPU (4T)") },
+                            shape = RoundedCornerShape(12.dp),
+                        )
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(24.dp))
     }
 }
-

@@ -22,3 +22,4 @@ local.properties
 /feature-video/build
 /benchmark/build
 /app/src/main/res
+/app/release
