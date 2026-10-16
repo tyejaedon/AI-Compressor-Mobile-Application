@@ -49,8 +49,11 @@ fun VortexNavGraph(
         composable(VortexDestination.Video.route) {
             VideoCompressionRoute(snackbarHostState = snackbarHostState)
         }
+        composable(VortexDestination.AicStudio.route) {
+            com.example.compressorai.ui.AicStudioScreen(snackbarHostState = snackbarHostState)
+        }
         composable(VortexDestination.Benchmark.route) {
-            BenchmarkScreen(latenciesMs = remember { listOf(7.2, 8.1, 7.8, 9.4, 7.0, 8.8, 9.0) })
+            BenchmarkScreen()
         }
     }
 }

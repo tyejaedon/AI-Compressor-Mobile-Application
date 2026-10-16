@@ -89,6 +89,30 @@ class MediaIo(
         return saveBitmap(strip, baseName)
     }
 
+    fun getFileSizeBytes(uri: Uri): Long {
+        if (uri.scheme == "file") {
+            val path = uri.path ?: return 0L
+            return File(path).length()
+        }
+        return runCatching {
+            resolver.openFileDescriptor(uri, "r")?.use { it.statSize }
+        }.getOrNull() ?: runCatching {
+            resolver.openInputStream(uri)?.use { it.available().toLong() }
+        }.getOrNull() ?: 0L
+    }
+
+    fun saveAicBytes(bytes: ByteArray, baseName: String): Uri {
+        val file = File(context.cacheDir, "$baseName-${System.currentTimeMillis()}.aic")
+        FileOutputStream(file).use { out ->
+            out.write(bytes)
+        }
+        return FileProvider.getUriForFile(context, "${context.packageName}.provider", file)
+    }
+
+    fun openAicInputStream(uri: Uri): java.io.InputStream {
+        return resolver.openInputStream(uri) ?: error("Unable to open AIC input stream from $uri")
+    }
+
     private fun wavHeader(dataSize: Int, sampleRate: Int): ByteArray {
         val channels = 1
         val bitsPerSample = 16
@@ -113,4 +137,5 @@ class MediaIo(
         }.array()
     }
 }
+
 
